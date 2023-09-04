@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # NeuRay
 
 Rendered video without training on the scene.
@@ -206,3 +207,6 @@ We thank all the authors for sharing great codes or datasets.
   year={2022}
 }
 ```
+=======
+# Nelf
+>>>>>>> 70541a350e890d5423ed3b460bc072c849e1879e
