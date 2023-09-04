@@ -88,8 +88,19 @@ def render_video_gen(database_name: str,
     cfg['render_depth'] = render_depth
     # load model
     renderer = name2network[cfg['network']](cfg)
-    ckpt = torch.load(f'data/model/{cfg["name"]}/model_best.pth')
-    renderer.load_state_dict(ckpt['network_state_dict'])
+    if flags.exp_name:
+        ckpt_path = f'data/model/{flags.exp_name}/model_best.pth'
+    else:
+        ckpt_path = f'data/model/{cfg["name"]}/model_best.pth'
+
+    if os.path.exists(ckpt_path):
+        print(f"Load from {ckpt_path}...")
+        ckpt = torch.load(ckpt_path)
+        renderer.load_state_dict(ckpt['network_state_dict'])
+        step = ckpt["step"]
+    else:
+        print("No pretrained model!!!")
+        step = 0
     renderer.cuda()
     renderer.eval()
     step = ckpt["step"]

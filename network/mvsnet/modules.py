@@ -32,7 +32,6 @@ def homo_warp(src_feat, src_proj, ref_proj_inv, depth_values):
     D = depth_values.shape[1]
     device = src_feat.device
     dtype = src_feat.dtype
-
     transform = src_proj @ ref_proj_inv
     R = transform[:, :3, :3] # (B, 3, 3)
     T = transform[:, :3, 3:] # (B, 3, 1)

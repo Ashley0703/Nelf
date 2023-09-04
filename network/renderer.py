@@ -15,11 +15,12 @@ from network.ops import ResUNetLight
 from network.sph_solver import SphericalHarmonicsSolver
 from network.vis_encoder import name2vis_encoder
 from network.render_ops import *
+from network.render_ops import *
+from network.NeRFMLP import *
 from utils.base_utils import to_cuda, load_cfg, color_map_backward, get_coords_mask
 from utils.draw_utils import concat_images_list
 from utils.imgs_info import build_imgs_info, imgs_info_to_torch, imgs_info_slice
 from utils.view_select import compute_nearest_camera_indices, select_working_views
-
 
 class NeuralRayBaseRenderer(nn.Module):
     base_cfg={
@@ -57,10 +58,11 @@ class NeuralRayBaseRenderer(nn.Module):
         self.dist_decoder = name2dist_decoder[self.cfg['dist_decoder_type']](self.cfg['dist_decoder_cfg'])
         self.image_encoder = ResUNetLight(3, [1,2,6,4], 32, inplanes=16)
         self.agg_net = name2agg_net[self.cfg['agg_net_type']](self.cfg['agg_net_cfg'])
+        self.NeRFMLP = NeRFMLP()
+        self.NeRFMLP.cuda()
         if self.cfg['use_hierarchical_sampling']:
             self.fine_dist_decoder = name2dist_decoder[self.cfg['dist_decoder_type']](self.cfg['fine_dist_decoder_cfg'])
             self.fine_agg_net = name2agg_net[self.cfg['agg_net_type']](self.cfg['fine_agg_net_cfg'])
-
         # if self.cfg['use_dr_prediction'] and not self.cfg['use_nr_color_for_dr']:
         self.sph_fitter = SphericalHarmonicsSolver(3)
 
@@ -153,18 +155,7 @@ class NeuralRayBaseRenderer(nn.Module):
         que_ray_feats = interpolate_feature_map(que_imgs_info['ray_feats'], que_imgs_info['coords'], mask, h, w)  # qn,rn,f
         hit_prob_que = self.predict_self_hit_prob_impl(que_ray_feats, que_depth, que_dists, que_imgs_info['depth_range'], is_fine)
         return hit_prob_que
-
-    def network_rendering(self, prj_dict, que_dir, is_fine):
-        if is_fine:
-            density, colors = self.fine_agg_net(prj_dict, que_dir)
-        else:
-            density, colors = self.agg_net(prj_dict, que_dir)
-
-        alpha_values = 1.0 - torch.exp(-torch.relu(density))
-        hit_prob = alpha_values2hit_prob(alpha_values)
-        pixel_colors = torch.sum(hit_prob.unsqueeze(-1)*colors,2)
-        return hit_prob, colors, pixel_colors
-
+    
     def render_by_depth(self, que_depth, que_imgs_info, ref_imgs_info, is_train, is_fine):
         ref_imgs_info = ref_imgs_info.copy()
         que_imgs_info = que_imgs_info.copy()
@@ -175,7 +166,11 @@ class NeuralRayBaseRenderer(nn.Module):
         prj_dict = self.predict_proj_ray_prob(prj_dict, ref_imgs_info, que_dists, is_fine)
         prj_dict = self.get_img_feats(ref_imgs_info, prj_dict)
 
-        hit_prob_nr, colors_nr, pixel_colors_nr = self.network_rendering(prj_dict, que_dir, is_fine)
+        # no color blending
+        if not self.cfg['color_blending']:
+            hit_prob_nr, colors_nr, pixel_colors_nr = self.network_rendering_no_color_blending(prj_dict, que_dir, que_pts)
+        else:
+            hit_prob_nr, colors_nr, pixel_colors_nr = self.network_rendering(prj_dict, que_dir, is_fine)
         outputs={'pixel_colors_nr': pixel_colors_nr, 'hit_prob_nr': hit_prob_nr}
 
         # direct rendering
@@ -213,6 +208,25 @@ class NeuralRayBaseRenderer(nn.Module):
             que_depth = torch.sort(fine_depth, -1)[0]
         outputs = self.render_by_depth(que_depth, que_imgs_info, ref_imgs_info, is_train, True)
         return outputs
+
+    def network_rendering(self, prj_dict, que_dir, is_fine):
+        if is_fine:
+            density, colors = self.fine_agg_net(prj_dict, que_dir)
+        else:
+            density, colors = self.agg_net(prj_dict, que_dir)
+        alpha_values = 1.0 - torch.exp(-torch.relu(density))
+        hit_prob = alpha_values2hit_prob(alpha_values)
+        pixel_colors = torch.sum(hit_prob.unsqueeze(-1)*colors,2)
+        return hit_prob, colors, pixel_colors
+    
+    def network_rendering_no_color_blending(self, prj_dict, que_dir, que_pts):
+        raw = self.NeRFMLP(que_pts, que_dir)
+        colors = raw[:,:,:,:3]
+        density, _ = self.agg_net(prj_dict, que_dir)
+        alpha_values = 1.0 - torch.exp(-torch.relu(density))
+        hit_prob = alpha_values2hit_prob(alpha_values)
+        pixel_colors = torch.sum(hit_prob.unsqueeze(-1)*colors,2)
+        return hit_prob, colors, pixel_colors
 
     def render_impl(self, que_imgs_info, ref_imgs_info, is_train):
         # [qn,rn,dn]
@@ -264,7 +278,6 @@ class NeuralRayGenRenderer(NeuralRayBaseRenderer):
         cfg={**self.default_cfg,**cfg}
         super().__init__(cfg)
         self.init_net=name2init_net[self.cfg['init_net_type']](self.cfg['init_net_cfg'])
-
     def render_call(self, que_imgs_info, ref_imgs_info, is_train, src_imgs_info=None):
         ref_imgs_info['ray_feats'] = self.init_net(ref_imgs_info, src_imgs_info, is_train)
         return self.render(que_imgs_info, ref_imgs_info, is_train)

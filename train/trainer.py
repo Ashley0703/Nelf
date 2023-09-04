@@ -16,6 +16,8 @@ from train.train_tools import to_cuda, Logger, reset_learning_rate, MultiGPUWrap
 from train.train_valid import ValidationEvaluator
 from utils.dataset_utils import simple_collate_fn, dummy_collate_fn
 
+import torch.utils.data.distributed
+import torch.distributed as dist
 
 class Trainer:
     default_cfg={
@@ -35,19 +37,41 @@ class Trainer:
     }
     def _init_dataset(self):
         self.train_set=name2dataset[self.cfg['train_dataset_type']](self.cfg['train_dataset_cfg'], True)
-        self.train_set=DataLoader(self.train_set,1,True,num_workers=self.cfg['worker_num'],collate_fn=dummy_collate_fn)
-        print(f'train set len {len(self.train_set)}')
+        if self.distributed:
+            self.train_sampler = torch.utils.data.DistributedSampler(self.train_set)
+            self.train_set=DataLoader(self.train_set,1, shuffle=False, sampler=self.train_sampler, num_workers=self.cfg['worker_num'],collate_fn=dummy_collate_fn)
+        else:
+            self.train_set=DataLoader(self.train_set,1,shuffle=True,num_workers=self.cfg['worker_num'],collate_fn=dummy_collate_fn)
+        # batch_size=total_batch_size
+        if not self.distributed or self.local_rank == 0:
+            print(f'train set len {len(self.train_set)}')
+        
         self.val_set_list, self.val_set_names = [], []
         for val_set_cfg in self.cfg['val_set_list']:
             name, val_type, val_cfg = val_set_cfg['name'], val_set_cfg['type'], val_set_cfg['cfg']
             val_set = name2dataset[val_type](val_cfg, False)
-            val_set = DataLoader(val_set,1,False,num_workers=self.cfg['worker_num'],collate_fn=dummy_collate_fn)
+            if self.distributed:
+                sampler_val = torch.utils.data.distributed.DistributedSampler(
+                    val_set, shuffle=False
+                )
+                val_set = DataLoader(val_set,1,False, sampler=sampler_val,num_workers=self.cfg['worker_num'],collate_fn=dummy_collate_fn)
+            else:
+                val_set = DataLoader(val_set,1,False,num_workers=self.cfg['worker_num'],collate_fn=dummy_collate_fn)
+              
             self.val_set_list.append(val_set)
             self.val_set_names.append(name)
-            print(f'{name} val set len {len(val_set)}')
+            if not self.distributed or self.local_rank == 0:
+                print(f'{name} val set len {len(val_set)}')
 
     def _init_network(self):
         self.network=name2network[self.cfg['network']](self.cfg).cuda()
+
+        if self.distributed:
+            self.network = torch.nn.parallel.DistributedDataParallel(self.network, device_ids=[self.local_rank], 
+                            output_device=self.local_rank, find_unused_parameters=True)
+        else:
+            # self.network = torch.nn.parallel.DataParallel(self.network)
+            pass
 
         # loss
         self.val_losses = []
@@ -63,14 +87,8 @@ class Trainer:
                 self.val_metrics.append(name2loss[metric_name](self.cfg))
 
         # we do not support multi gpu training for NeuRay
-        if self.cfg['multi_gpus']:
-            raise NotImplementedError
-            # make multi gpu network
-            # self.train_network=DataParallel(MultiGPUWrapper(self.network,self.val_losses))
-            # self.train_losses=[DummyLoss(self.val_losses)]
-        else:
-            self.train_network=self.network
-            self.train_losses=self.val_losses
+        self.train_network=self.network
+        self.train_losses=self.val_losses
 
         if self.cfg['optimizer_type']=='adam':
             self.optimizer = Adam
@@ -83,8 +101,14 @@ class Trainer:
         self.lr_manager=name2lr_manager[self.cfg['lr_type']](self.cfg['lr_cfg'])
         self.optimizer=self.lr_manager.construct_optimizer(self.optimizer,self.network)
 
-    def __init__(self,cfg):
+    def __init__(self,cfg,exp_name=None, distributed=False, local_rank=None):
         self.cfg={**self.default_cfg,**cfg}
+
+        self.distributed = distributed
+        self.local_rank = local_rank
+        
+        if exp_name is not None:
+            cfg['name'] = exp_name
         self.model_name=cfg['name']
         self.model_dir=os.path.join('data/model',cfg['name'])
         if not os.path.exists(self.model_dir): os.mkdir(self.model_dir)
@@ -101,67 +125,73 @@ class Trainer:
 
         pbar=tqdm(total=self.cfg['total_step'],bar_format='{r_bar}')
         pbar.update(start_step)
-        for step in range(start_step,self.cfg['total_step']):
-            try:
-                train_data = next(train_iter)
-            except StopIteration:
-                self.train_set.dataset.reset()
-                train_iter = iter(self.train_set)
-                train_data = next(train_iter)
-            if not self.cfg['multi_gpus']:
-                train_data = to_cuda(train_data)
-            train_data['step']=step
+        step = start_step
+        epoch = 0
+        while step < self.cfg['total_step']:
+            for train_data in self.train_set:
+                if self.distributed:
+                    self.train_sampler.set_epoch(epoch)
 
-            self.train_network.train()
-            self.network.train()
-            lr = self.lr_manager(self.optimizer, step)
+                if not self.cfg['multi_gpus']:
+                    train_data = to_cuda(train_data)
+                train_data['step']=step
 
-            self.optimizer.zero_grad()
-            self.train_network.zero_grad()
+                self.train_network.train()
+                self.network.train()
+                lr = self.lr_manager(self.optimizer, step)
 
-            log_info={}
-            outputs=self.train_network(train_data)
-            for loss in self.train_losses:
-                loss_results = loss(outputs,train_data,step)
-                for k,v in loss_results.items():
-                    log_info[k]=v
+                self.optimizer.zero_grad()
+                self.train_network.zero_grad()
 
-            loss=0
-            for k,v in log_info.items():
-                if k.startswith('loss'):
-                    loss=loss+torch.mean(v)
+                log_info={}
+                # self.train_nettwork = self.train_network.cpu()
+                outputs=self.train_network(train_data)
+                for loss in self.train_losses:
+                    loss_results = loss(outputs,train_data,step)
+                    for k,v in loss_results.items():
+                        log_info[k]=v
 
-            loss.backward()
-            self.optimizer.step()
-            if ((step+1) % self.cfg['train_log_step']) == 0:
-                self._log_data(log_info,step+1,'train')
+                loss=0
+                for k,v in log_info.items():
+                    if k.startswith('loss'):
+                        loss=loss+torch.mean(v)
+                loss.backward()
+                self.optimizer.step()
+                if ((step+1) % self.cfg['train_log_step']) == 0:
+                    if not self.distributed or self.local_rank == 0:
+                        self._log_data(log_info,step+1,'train')
 
-            if (step+1)%self.cfg['val_interval']==0 or (step+1)==self.cfg['total_step']:
-                torch.cuda.empty_cache()
-                val_results={}
-                val_para = 0
-                for vi, val_set in enumerate(self.val_set_list):
-                    val_results_cur, val_para_cur = self.val_evaluator(
-                        self.network, self.val_losses + self.val_metrics, val_set, step,
-                        self.model_name, val_set_name=self.val_set_names[vi])
-                    for k,v in val_results_cur.items():
-                        val_results[f'{self.val_set_names[vi]}-{k}'] = v
-                    # always use the final val set to select model!
-                    val_para = val_para_cur
+                if (step+1)%self.cfg['val_interval']==0 or (step+1)==self.cfg['total_step']:
+                    if not self.distributed or self.local_rank == 0:  
+                        torch.cuda.empty_cache()
+                        val_results={}
+                        val_para = 0
+                        for vi, val_set in enumerate(self.val_set_list):
+                            val_results_cur, val_para_cur = self.val_evaluator(
+                                self.network, self.val_losses + self.val_metrics, val_set, step,
+                                self.model_name, val_set_name=self.val_set_names[vi])
+                            for k,v in val_results_cur.items():
+                                val_results[f'{self.val_set_names[vi]}-{k}'] = v
+                            # always use the final val set to select model!
+                            val_para = val_para_cur
 
-                if val_para>best_para:
-                    print(f'New best model {self.cfg["key_metric_name"]}: {val_para:.5f} previous {best_para:.5f}')
-                    best_para=val_para
-                    self._save_model(step+1,best_para,self.best_pth_fn)
-                self._log_data(val_results,step+1,'val')
-                del val_results, val_para, val_para_cur, val_results_cur
+                        if val_para>best_para:
+                            print(f'New best model {self.cfg["key_metric_name"]}: {val_para:.5f} previous {best_para:.5f}')
+                            best_para=val_para
+                            self._save_model(step+1,best_para,self.best_pth_fn)
+                        self._log_data(val_results,step+1,'val')
+                        del val_results, val_para, val_para_cur, val_results_cur
 
-            if (step+1)%self.cfg['save_interval']==0:
-                self._save_model(step+1,best_para)
+                if (step+1)%self.cfg['save_interval']==0:
+                    if not self.distributed or self.local_rank == 0:
+                        self._save_model(step+1,best_para)
 
-            pbar.set_postfix(loss=float(loss.detach().cpu().numpy()),lr=lr)
-            pbar.update(1)
-            del loss, log_info
+                pbar.set_postfix(loss=float(loss.detach().cpu().numpy()),lr=lr)
+                pbar.update(1)
+                del loss, log_info
+
+                step += 1
+            epoch += 1
 
         pbar.close()
 

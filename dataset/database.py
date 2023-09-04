@@ -847,10 +847,14 @@ class RealEstateDatabase(BaseDatabase):
         fns = os.listdir(f'{self.root_dir}/frames/{model_name}')
         self.img_ids = [fn.split('.')[0] for fn in fns]
         self.img_ids = np.asarray(self.img_ids)
-        idxs = np.argsort(self.img_ids.astype(np.int32))
+        # idxs = np.argsort(self.img_ids.astype(np.int32))
+        idxs = np.argsort([int(id, 16) for id in self.img_ids])
         self.img_ids = self.img_ids[idxs]
         self.img_ids = self.img_ids.tolist()
-        self.cam_params = parse_pose_file(f'{self.root_dir}/cameras/{model_name}.txt')
+        self.cam_params = {}
+        for img_id in self.img_ids:
+            self.cam_params[img_id] = parse_pose_file(f'{self.root_dir}/cameras/{img_id}.txt')
+        # self.cam_params = parse_pose_file(f'{self.root_dir}/cameras/{model_name}.txt')
         self.range_dict = {img_id: np.asarray((1.,100.),np.float32) for img_id in self.img_ids}
         self.depth_img_ids = [img_id for img_id in self.img_ids if self._depth_existence(img_id)]
 

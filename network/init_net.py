@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from inplace_abn import ABN
+import ipdb
 
 from network.mvsnet.modules import depth_regression
 from network.mvsnet.mvsnet import MVSNet, load_ckpt
@@ -148,10 +149,10 @@ def construct_cost_volume_with_src(
         if not is_train:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-        try:
-            cost_reg = mvsnet.construct_cost_volume_with_src(ref_imgs_imagenet, src_imgs_imagenet, nn_ids, ref_prj, src_prj, depth_vals, batch_num)  # rfn,dn,h,w
-        except RuntimeError:
-            import ipdb; ipdb.set_trace()
+        # try:
+        cost_reg = mvsnet.construct_cost_volume_with_src(ref_imgs_imagenet, src_imgs_imagenet, nn_ids, ref_prj, src_prj, depth_vals, batch_num)  # rfn,dn,h,w
+        # except RuntimeError:
+        #     ipdb.set_trace()
         cost_reg[torch.isnan(cost_reg)] = 0
         if resize: cost_reg = F.interpolate(cost_reg, (h // 4, w // 4), mode='bilinear')
         cost_reg = F.softmax(cost_reg, 1)

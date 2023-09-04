@@ -3,6 +3,7 @@ name: neuray_gen_cost_volume_train
 # network
 network: neuray_gen
 init_net_type: cost_volume
+multi_gpus: true
 use_hierarchical_sampling: true
 use_depth_loss: true
 dist_decoder_cfg:
@@ -10,6 +11,7 @@ dist_decoder_cfg:
 fine_dist_decoder_cfg:
   use_vis: false
 ray_batch_num: 2048
+color_blending: false
 
 # loss
 loss: [render, depth]
